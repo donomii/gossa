@@ -1,6 +1,8 @@
 package main
 
 import (
+	"archive/zip"
+	"compress/gzip"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -79,7 +81,7 @@ func humanize(bytes int64) string {
 	}
 }
 
-func replyList(w http.ResponseWriter, fullPath string, path string) {
+func replyList(w http.ResponseWriter, r *http.Request, fullPath string, path string) {
 	_files, err := ioutil.ReadDir(fullPath)
 	check(err)
 	sort.Slice(_files, func(i, j int) bool { return strings.ToLower(_files[i].Name()) < strings.ToLower(_files[j].Name()) })
@@ -115,7 +117,15 @@ func replyList(w http.ResponseWriter, fullPath string, path string) {
 		}
 	}
 
-	page.Execute(w, p)
+	if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+		w.Header().Set("Content-Type", "text/html")
+		w.Header().Add("Content-Encoding", "gzip")
+		gz, _ := gzip.NewWriterLevel(w, gzip.BestSpeed) // BestSpeed is much faster than Default on a very unscientific local test, and only ~30% larger (compression remains still very effective, ~6x)
+		defer gz.Close()
+		page.Execute(gz, p)
+	} else {
+		page.Execute(w, p)
+	}
 }
 
 func doContent(w http.ResponseWriter, r *http.Request) {
@@ -131,7 +141,7 @@ func doContent(w http.ResponseWriter, r *http.Request) {
 	check(errStat)
 
 	if stat.IsDir() {
-		replyList(w, fullPath, path)
+		replyList(w, r, fullPath, path)
 	} else {
 		fs.ServeHTTP(w, r)
 	}
@@ -147,12 +157,41 @@ func upload(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("ok"))
 }
 
+func walkZip(wz *zip.Writer, fp, baseInZip string) {
+	files, err := ioutil.ReadDir(fp)
+	check(err)
+
+	for _, file := range files {
+		if !file.IsDir() {
+			data, err := ioutil.ReadFile(fp + file.Name())
+			check(err)
+			f, err := wz.Create(baseInZip + file.Name())
+			check(err)
+			_, err = f.Write(data)
+			check(err)
+		} else if file.IsDir() {
+			newBase := fp + file.Name() + "/"
+			walkZip(wz, newBase, baseInZip+file.Name()+"/")
+		}
+	}
+}
+
+func zipRPC(w http.ResponseWriter, r *http.Request) {
+	zipPath := r.URL.Query().Get("zipPath")
+	zipName := r.URL.Query().Get("zipName")
+	defer exitPath(w, "zip", zipPath)
+	wz := zip.NewWriter(w)
+	w.Header().Add("Content-Disposition", "attachment; filename=\""+zipName+".zip\"")
+	walkZip(wz, checkPath(zipPath)+"/", "")
+	wz.Close()
+}
+
 func rpc(w http.ResponseWriter, r *http.Request) {
 	var err error
 	var rpc rpcCall
+	defer exitPath(w, "rpc", rpc)
 	bodyBytes, _ := ioutil.ReadAll(r.Body)
 	json.Unmarshal(bodyBytes, &rpc)
-	defer exitPath(w, "rpc", rpc)
 
 	if rpc.Call == "mkdirp" {
 		err = os.MkdirAll(checkPath(rpc.Args[0]), os.ModePerm)
@@ -197,9 +236,11 @@ func main() {
 		http.HandleFunc(*extraPath+"rpc", rpc)
 		http.HandleFunc(*extraPath+"post", upload)
 	}
+
+	http.HandleFunc(*extraPath+"zip", zipRPC)
 	http.HandleFunc("/", doContent)
 	fs = http.StripPrefix(*extraPath, http.FileServer(http.Dir(initPath)))
-	fmt.Printf("Gossa startig on directory %s\nListening on http://%s:%s%s\n", initPath, *host, *port, *extraPath)
+	fmt.Printf("Gossa starting on directory %s\nListening on http://%s:%s%s\n", initPath, *host, *port, *extraPath)
 	err = http.ListenAndServe(*host+":"+*port, nil)
 	check(err)
 }
